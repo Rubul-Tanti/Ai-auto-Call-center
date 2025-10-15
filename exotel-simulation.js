@@ -1,5 +1,6 @@
 const WebSocket = require('ws');
 const fs = require('fs');
+const { spawn } = require('child_process');
 
 // This simulates what Exotel does
 const SERVER_URL = process.env.SERVER_URL || 'ws://localhost:8080'; // Use ws:// for local, wss:// for remote
