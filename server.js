@@ -137,7 +137,7 @@ class VoiceSession {
           headers: {
             'Authorization': CONFIG.VOICEFLOW_API_KEY,
             'Content-Type': 'application/json',
-            'versionID': CONFIG.VOICEFLOW_VERSION_ID
+            // 'versionID': CONFIG.VOICEFLOW_VERSION_ID
           }
         }
       );
