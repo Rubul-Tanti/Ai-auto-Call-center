@@ -12,4 +12,8 @@ COPY . .
 
 EXPOSE 8080
 
+# Set environment variable for Railway
+ENV NODE_ENV=production
+ENV PORT=8080
+
 CMD ["node", "server.js"]

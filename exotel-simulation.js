@@ -3,7 +3,7 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 
 // This simulates what Exotel does
-const SERVER_URL = process.env.SERVER_URL || 'ws://localhost:8080'; // Use ws:// for local, wss:// for remote
+const SERVER_URL = process.env.SERVER_URL || ': ws://ai-auto-call-center.railway.app'; // Use ws:// for local, wss:// for remote
 
 console.log('🎤 Exotel Simulator - Testing Voice AI Server\n');
 console.log(`Connecting to: ${SERVER_URL}`);
