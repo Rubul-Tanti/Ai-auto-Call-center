@@ -7,8 +7,11 @@ const { Readable } = require('stream');
 
 require('dotenv').config();
 
-// Set FFmpeg path for Windows
-ffmpeg.setFfmpegPath('C:\\Users\\rubul\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.0-full_build\\bin\\ffmpeg.exe');
+// Set FFmpeg path only on Windows (local development)
+if (process.platform === 'win32') {
+  ffmpeg.setFfmpegPath('C:\\Users\\rubul\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.0-full_build\\bin\\ffmpeg.exe');
+}
+// On Railway/Linux, FFmpeg will be installed via nixpacks and available in PATH
 
 // Initialize Express app
 const app = express();
@@ -331,16 +334,21 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 process.on('SIGTERM', () => {
-  console.log('Shutting down...');
-  wss.clients.forEach(client => {
-    const session = sessions.get(client);
-    if (session) session.cleanup();
-    client.close();
+  console.log('Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
   });
-  server.close(() => process.exit(0));
+  
+  // Force exit after 10 seconds
+  setTimeout(() => {
+    console.error('Forcing exit...');
+    process.exit(1);
+  }, 10000);
 });
 
-// Keep process alive
+// Keep process alive and log health
 setInterval(() => {
-  console.log(`[${new Date().toISOString()}] Active sessions: ${sessions.size}`);
-}, 60000);
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] Health check - Active sessions: ${sessions.size}`);
+}, 30000);
