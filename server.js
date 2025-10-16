@@ -352,7 +352,7 @@ process.on('SIGTERM', () => {
     process.exit(1);
   }, 10000);
 });
-
+console.log('ElevenLabs API Key (first 20 chars):', CONFIG.ELEVENLABS_API_KEY?.substring(0, 20));
 // Keep process alive and log health
 setInterval(() => {
   const timestamp = new Date().toISOString();
