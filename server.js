@@ -4,6 +4,8 @@ const http = require('http');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const { Readable } = require('stream');
+const fs = require('fs');
+const path = require('path');
 
 require('dotenv').config();
 
@@ -11,7 +13,24 @@ require('dotenv').config();
 if (process.platform === 'win32') {
   ffmpeg.setFfmpegPath('C:\\Users\\rubul\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.0-full_build\\bin\\ffmpeg.exe');
 }
-// On Railway/Linux, FFmpeg will be installed via nixpacks and available in PATH
+
+// Initialize Google Cloud TTS
+const textToSpeech = require('@google-cloud/text-to-speech');
+
+let ttsClient;
+
+// Initialize Google Cloud client
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+  try {
+    const credentialsJson = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+    ttsClient = new textToSpeech.TextToSpeechClient({
+      credentials: credentialsJson
+    });
+    console.log('✓ Google Cloud TTS initialized');
+  } catch (error) {
+    console.error('✗ Failed to initialize Google Cloud TTS:', error.message);
+  }
+}
 
 // Initialize Express app
 const app = express();
@@ -23,8 +42,6 @@ const CONFIG = {
   DEEPGRAM_API_KEY: process.env.DEEPGRAM_API_KEY,
   VOICEFLOW_API_KEY: process.env.VOICEFLOW_API_KEY,
   VOICEFLOW_VERSION_ID: process.env.VOICEFLOW_VERSION_ID,
-  ELEVENLABS_API_KEY: process.env.ELEVENLABS_API_KEY,
-  ELEVENLABS_VOICE_ID: process.env.ELEVENLABS_VOICE_ID,
   PORT: process.env.PORT || 8080
 };
 
@@ -39,8 +56,7 @@ console.log('Checking API Keys:');
 console.log('  DEEPGRAM_API_KEY:', CONFIG.DEEPGRAM_API_KEY ? '✓ SET' : '✗ MISSING');
 console.log('  VOICEFLOW_API_KEY:', CONFIG.VOICEFLOW_API_KEY ? '✓ SET' : '✗ MISSING');
 console.log('  VOICEFLOW_VERSION_ID:', CONFIG.VOICEFLOW_VERSION_ID ? '✓ SET' : '✗ MISSING');
-console.log('  ELEVENLABS_API_KEY:', CONFIG.ELEVENLABS_API_KEY ? '✓ SET' : '✗ MISSING');
-console.log('  ELEVENLABS_VOICE_ID:', CONFIG.ELEVENLABS_VOICE_ID ? '✓ SET' : '✗ MISSING');
+console.log('  GOOGLE_CLOUD_TTS:', ttsClient ? '✓ INITIALIZED' : '✗ NOT READY');
 console.log('='.repeat(70) + '\n');
 
 // Helper function to convert MP3 to mulaw
@@ -198,33 +214,32 @@ class VoiceSession {
   async convertToSpeech(text) {
     try {
       console.log(`[${this.sessionId}] → Converting text to speech: "${text}"`);
-      console.log(`[${this.sessionId}] → Using Voice ID: ${CONFIG.ELEVENLABS_VOICE_ID}`);
       
-      const response = await axios.post(
-        `https://api.elevenlabs.io/v1/text-to-speech/${CONFIG.ELEVENLABS_VOICE_ID}/stream`,
-        {
-          text: text,
-          model_id: 'eleven_monolingual_v1',
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75
-          }
-        },
-        {
-          headers: {
-            'Accept': 'audio/mpeg',
-            'Content-Type': 'application/json',
-            'xi-api-key': CONFIG.ELEVENLABS_API_KEY
-          },
-          responseType: 'arraybuffer',
-          timeout: 30000
-        }
-      );
+      if (!ttsClient) {
+        throw new Error('Google Cloud TTS not initialized');
+      }
 
-      console.log(`[${this.sessionId}] ✓ Received MP3 audio (${response.data.length} bytes)`);
+      const request = {
+        input: { text: text },
+        voice: {
+          languageCode: 'en-US',
+          name: 'en-US-Neural2-C', // Professional voice
+        },
+        audioConfig: {
+          audioEncoding: 'MP3',
+          pitch: 0,
+          speakingRate: 1,
+        },
+      };
+
+      console.log(`[${this.sessionId}] → Calling Google Cloud TTS API...`);
+      const [response] = await ttsClient.synthesizeSpeech(request);
+      const mp3Audio = response.audioContent;
+
+      console.log(`[${this.sessionId}] ✓ Received MP3 audio (${mp3Audio.length} bytes)`);
       console.log(`[${this.sessionId}] → Starting FFmpeg conversion...`);
 
-      const mulawAudio = await convertMp3ToMulaw(Buffer.from(response.data));
+      const mulawAudio = await convertMp3ToMulaw(Buffer.from(mp3Audio));
       console.log(`[${this.sessionId}] ✓ Converted to mulaw (${mulawAudio.length} bytes)`);
 
       if (this.exotelWs.readyState === WebSocket.OPEN) {
@@ -243,10 +258,8 @@ class VoiceSession {
       }
     } catch (error) {
       console.error(`[${this.sessionId}] ✗ TTS error:`, error.message);
-      console.error(`[${this.sessionId}] Error details:`, error);
       if (error.response) {
         console.error(`[${this.sessionId}] Response status:`, error.response.status);
-        console.error(`[${this.sessionId}] Response data:`, error.response.data);
       }
     }
   }
@@ -317,15 +330,15 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start server - listen on all interfaces for Railway
+// Start server - listen on all interfaces for Railway/Render
 server.listen(CONFIG.PORT, '0.0.0.0', () => {
   console.log('\n' + '='.repeat(70));
   console.log('VOICE AI PIPELINE SERVER STARTED');
   console.log('='.repeat(70));
   console.log(`Port: ${CONFIG.PORT}`);
   console.log(`Listening on: 0.0.0.0:${CONFIG.PORT}`);
-  console.log(`WebSocket URL: wss://ai-auto-call-center.railway.app`);
-  console.log(`Health check: https://ai-auto-call-center.railway.app/health`);
+  console.log(`WebSocket URL: wss://ai-auto-call-center.onrender.com`);
+  console.log(`Health check: https://ai-auto-call-center.onrender.com/health`);
   console.log('='.repeat(70) + '\n');
 });
 
@@ -346,13 +359,12 @@ process.on('SIGTERM', () => {
     process.exit(0);
   });
   
-  // Force exit after 10 seconds
   setTimeout(() => {
     console.error('Forcing exit...');
     process.exit(1);
   }, 10000);
 });
-console.log('ElevenLabs API Key (first 20 chars):', CONFIG.ELEVENLABS_API_KEY?.substring(0, 20));
+
 // Keep process alive and log health
 setInterval(() => {
   const timestamp = new Date().toISOString();
