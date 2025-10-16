@@ -317,10 +317,16 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start server
-server.listen(CONFIG.PORT, () => {
-  console.log('SERVER READY - Waiting for calls...');
-  console.log(`WebSocket: wss://ai-auto-call-center.railway.app\n`);
+// Start server - listen on all interfaces for Railway
+server.listen(CONFIG.PORT, '0.0.0.0', () => {
+  console.log('\n' + '='.repeat(70));
+  console.log('VOICE AI PIPELINE SERVER STARTED');
+  console.log('='.repeat(70));
+  console.log(`Port: ${CONFIG.PORT}`);
+  console.log(`Listening on: 0.0.0.0:${CONFIG.PORT}`);
+  console.log(`WebSocket URL: wss://ai-auto-call-center.railway.app`);
+  console.log(`Health check: https://ai-auto-call-center.railway.app/health`);
+  console.log('='.repeat(70) + '\n');
 });
 
 // Error handlers
