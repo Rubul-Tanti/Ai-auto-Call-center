@@ -4,41 +4,19 @@ const http = require('http');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const { Readable } = require('stream');
-const fs = require('fs');
-const path = require('path');
+const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 
 require('dotenv').config();
 
-// Set FFmpeg path only on Windows (local development)
 if (process.platform === 'win32') {
   ffmpeg.setFfmpegPath('C:\\Users\\rubul\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.0-full_build\\bin\\ffmpeg.exe');
 }
 
-// Initialize Google Cloud TTS
-const textToSpeech = require('@google-cloud/text-to-speech');
-
-let ttsClient;
-
-// Initialize Google Cloud client
-if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-  try {
-    const credentialsJson = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
-    ttsClient = new textToSpeech.TextToSpeechClient({
-      credentials: credentialsJson
-    });
-    console.log('✓ Google Cloud TTS initialized');
-  } catch (error) {
-    console.error('✗ Failed to initialize Google Cloud TTS:', error.message);
-  }
-}
-
-// Initialize Express app
 const app = express();
 app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Configuration
 const CONFIG = {
   DEEPGRAM_API_KEY: process.env.DEEPGRAM_API_KEY,
   VOICEFLOW_API_KEY: process.env.VOICEFLOW_API_KEY,
@@ -46,21 +24,17 @@ const CONFIG = {
   PORT: process.env.PORT || 8080
 };
 
-// Store active sessions
 const sessions = new Map();
 
-// Log startup
 console.log('\n' + '='.repeat(70));
 console.log('VOICE AI SERVER STARTING');
 console.log('='.repeat(70));
-console.log('Checking API Keys:');
-console.log('  DEEPGRAM_API_KEY:', CONFIG.DEEPGRAM_API_KEY ? '✓ SET' : '✗ MISSING');
-console.log('  VOICEFLOW_API_KEY:', CONFIG.VOICEFLOW_API_KEY ? '✓ SET' : '✗ MISSING');
-console.log('  VOICEFLOW_VERSION_ID:', CONFIG.VOICEFLOW_VERSION_ID ? '✓ SET' : '✗ MISSING');
-console.log('  GOOGLE_CLOUD_TTS:', ttsClient ? '✓ INITIALIZED' : '✗ NOT READY');
+console.log('API Keys:');
+console.log('  DEEPGRAM:', CONFIG.DEEPGRAM_API_KEY ? 'SET' : 'MISSING');
+console.log('  VOICEFLOW_KEY:', CONFIG.VOICEFLOW_API_KEY ? 'SET' : 'MISSING');
+console.log('  VOICEFLOW_VERSION:', CONFIG.VOICEFLOW_VERSION_ID ? 'SET' : 'MISSING');
 console.log('='.repeat(70) + '\n');
 
-// Helper function to convert MP3 to Linear PCM (16-bit, 8kHz, mono)
 async function convertMp3ToPcm(mp3Buffer) {
   return new Promise((resolve, reject) => {
     const buffers = [];
@@ -74,43 +48,33 @@ async function convertMp3ToPcm(mp3Buffer) {
       .audioFrequency(8000)
       .audioChannels(1)
       .format('s16le')
-      .on('error', (err) => {
-        console.error('FFmpeg error:', err.message);
-        reject(err);
-      })
+      .on('error', reject)
       .pipe()
-      .on('data', (chunk) => {
-        buffers.push(chunk);
-      })
-      .on('end', () => {
-        resolve(Buffer.concat(buffers));
-      })
-      .on('error', (err) => {
-        reject(err);
-      });
+      .on('data', (chunk) => buffers.push(chunk))
+      .on('end', () => resolve(Buffer.concat(buffers)))
+      .on('error', reject);
   });
 }
 
 class VoiceSession {
-  constructor(exotelWs, sessionId, callSid) {
+  constructor(exotelWs, streamSid, callSid) {
     this.exotelWs = exotelWs;
-    this.deepgramWs = null;
-    this.sessionId = sessionId;
+    this.deepgramConnection = null;
+    this.streamSid = streamSid;
     this.callSid = callSid;
     this.isProcessing = false;
     this.heartbeatInterval = null;
-    this.streamStarted = false;
-    this.audioBuffer = [];
-    this.silenceTimeout = null;
-    
-    console.log(`[${this.sessionId}] ✓ Session created | Call SID: ${this.callSid}`);
-    
+    this.audioReceivedCount = 0;
+    this.audioSentCount = 0;
+
+    console.log(`[${this.streamSid}] Session created | Call: ${this.callSid}`);
+
     this.exotelWs.on('ping', () => {
       if (this.exotelWs.readyState === WebSocket.OPEN) {
         this.exotelWs.pong();
       }
     });
-    
+
     this.initDeepgram();
     this.startHeartbeat();
   }
@@ -124,53 +88,62 @@ class VoiceSession {
   }
 
   initDeepgram() {
-    const deepgramUrl = `wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&interim_results=false`;
-    
-    this.deepgramWs = new WebSocket(deepgramUrl, {
-      headers: {
-        'Authorization': `Token ${CONFIG.DEEPGRAM_API_KEY}`
-      }
+    const deepgram = createClient(CONFIG.DEEPGRAM_API_KEY);
+
+    this.deepgramConnection = deepgram.listen.live({
+      model: 'nova-3',
+      language: 'en-US',
+      smart_format: true,
+      interim_results: true,
+      vad: true,
+      endpointing: '1ms'
     });
 
-    this.deepgramWs.on('open', () => {
-      console.log(`[${this.sessionId}] ✓ Deepgram WebSocket connected`);
+    this.deepgramConnection.on(LiveTranscriptionEvents.Open, () => {
+      console.log(`[${this.streamSid}] Deepgram connected`);
     });
 
-    this.deepgramWs.on('message', async (data) => {
+    this.deepgramConnection.on(LiveTranscriptionEvents.Transcript, async (data) => {
       try {
-        const response = JSON.parse(data);
-        
-        if (response.channel?.alternatives?.[0]?.transcript) {
-          const transcript = response.channel.alternatives[0].transcript;
-          
-          if (transcript.trim() && response.is_final && !this.isProcessing) {
-            console.log(`[${this.sessionId}] ✓ USER SAID: "${transcript}"`);
-            this.isProcessing = true;
-            await this.processWithVoiceflow(transcript);
-            this.isProcessing = false;
+        const transcript = data.channel?.alternatives?.[0]?.transcript;
+        const isFinal = data.is_final;
+        const speechFinal = data.speech_final;
+
+        if (transcript?.trim()) {
+          if (isFinal && speechFinal) {
+            console.log(`[${this.streamSid}] FINAL: "${transcript}"`);
+            console.log(`[${this.streamSid}] Requesting response...`);
+
+            if (!this.isProcessing) {
+              this.isProcessing = true;
+              await this.processWithVoiceflow(transcript);
+              this.isProcessing = false;
+            }
+          } else if (!isFinal) {
+            console.log(`[${this.streamSid}] interim: "${transcript}"`);
           }
         }
       } catch (error) {
-        console.error(`[${this.sessionId}] ✗ Deepgram error:`, error.message);
+        console.error(`[${this.streamSid}] Transcript error:`, error.message);
         this.isProcessing = false;
       }
     });
 
-    this.deepgramWs.on('error', (error) => {
-      console.error(`[${this.sessionId}] ✗ Deepgram connection error:`, error.message);
+    this.deepgramConnection.on(LiveTranscriptionEvents.Error, (error) => {
+      console.error(`[${this.streamSid}] Deepgram error:`, error.message);
     });
 
-    this.deepgramWs.on('close', () => {
-      console.log(`[${this.sessionId}] ✗ Deepgram disconnected`);
+    this.deepgramConnection.on(LiveTranscriptionEvents.Close, () => {
+      console.log(`[${this.streamSid}] Deepgram closed`);
     });
   }
 
   async processWithVoiceflow(userInput) {
     try {
-      console.log(`[${this.sessionId}] → Sending to Voiceflow...`);
-      
+      console.log(`[${this.streamSid}] Calling Voiceflow...`);
+
       const response = await axios.post(
-        `https://general-runtime.voiceflow.com/state/user/${this.sessionId}/interact`,
+        `https://general-runtime.voiceflow.com/state/user/${this.streamSid}/interact`,
         {
           action: {
             type: 'text',
@@ -194,114 +167,108 @@ class VoiceSession {
       let botResponse = '';
       if (response.data && Array.isArray(response.data)) {
         response.data.forEach(trace => {
-          if (trace.type === 'text' && trace.payload?.message) {
-            botResponse += trace.payload.message + ' ';
-          } else if (trace.type === 'speak' && trace.payload?.message) {
+          if ((trace.type === 'text' || trace.type === 'speak') && trace.payload?.message) {
             botResponse += trace.payload.message + ' ';
           }
         });
       }
 
       botResponse = botResponse.trim();
-      
+
       if (botResponse) {
-        console.log(`[${this.sessionId}] ✓ BOT SAYS: "${botResponse}"`);
+        console.log(`[${this.streamSid}] BOT: "${botResponse}"`);
         await this.convertToSpeech(botResponse);
       } else {
-        console.log(`[${this.sessionId}] ✗ No response from Voiceflow`);
+        console.log(`[${this.streamSid}] No response from Voiceflow`);
       }
     } catch (error) {
-      console.error(`[${this.sessionId}] ✗ Voiceflow error:`, error.message);
-      await this.convertToSpeech("Sorry, I didn't understand that. Please try again.");
+      console.error(`[${this.streamSid}] Voiceflow error:`, error.message);
+      await this.convertToSpeech("Sorry, I didn't understand that.");
     }
   }
 
   async convertToSpeech(text) {
     try {
-      console.log(`[${this.sessionId}] → Converting text to speech: "${text}"`);
-      
-      if (!ttsClient) {
-        throw new Error('Google Cloud TTS not initialized');
+      console.log(`[${this.streamSid}] Converting to speech: "${text}"`);
+
+      const deepgram = createClient(CONFIG.DEEPGRAM_API_KEY);
+
+      const response = await deepgram.speak.request(
+        { text },
+        {
+          model: 'aura-2-thalia-en',
+          encoding: 'linear16',
+          sample_rate: 8000
+        }
+      );
+
+      const stream = await response.getStream();
+
+      if (!stream) {
+        throw new Error('No audio stream from Deepgram');
       }
 
-      const request = {
-        input: { text: text },
-        voice: {
-          languageCode: 'en-US',
-          name: 'en-US-Neural2-C',
-        },
-        audioConfig: {
-          audioEncoding: 'MP3',
-          pitch: 0,
-          speakingRate: 1,
-        },
-      };
+      const reader = stream.getReader();
+      const chunks = [];
 
-      console.log(`[${this.sessionId}] → Calling Google Cloud TTS API...`);
-      const [response] = await ttsClient.synthesizeSpeech(request);
-      const mp3Audio = response.audioContent;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
 
-      console.log(`[${this.sessionId}] ✓ Received MP3 audio (${mp3Audio.length} bytes)`);
-      console.log(`[${this.sessionId}] → Converting MP3 to Linear PCM (16-bit, 8kHz, mono)...`);
+      const audioBuffer = Buffer.concat(chunks.map(chunk => Buffer.from(chunk)));
 
-      const pcmAudio = await convertMp3ToPcm(Buffer.from(mp3Audio));
-      console.log(`[${this.sessionId}] ✓ Converted to PCM (${pcmAudio.length} bytes)`);
-
-      await this.sendAudioToExotel(pcmAudio);
+      console.log(`[${this.streamSid}] Speech ready (${audioBuffer.length} bytes)`);
+      await this.sendAudioToExotel(audioBuffer);
     } catch (error) {
-      console.error(`[${this.sessionId}] ✗ TTS error:`, error.message);
-      if (error.response) {
-        console.error(`[${this.sessionId}] Response status:`, error.response.status);
-      }
+      console.error(`[${this.streamSid}] TTS error:`, error.message);
     }
   }
 
   async sendAudioToExotel(pcmAudio) {
     return new Promise((resolve) => {
       if (this.exotelWs.readyState !== WebSocket.OPEN) {
-        console.error(`[${this.sessionId}] ✗ Exotel WebSocket not open (state: ${this.exotelWs.readyState})`);
+        console.error(`[${this.streamSid}] WebSocket not open`);
         resolve();
         return;
       }
 
-      console.log(`[${this.sessionId}] ✓ WebSocket is OPEN, sending audio in base64...`);
-      
-      // 100ms of audio at 8kHz = 800 samples = 1600 bytes (16-bit mono)
-      const CHUNK_SIZE = 1600;
+      if (!pcmAudio || pcmAudio.length === 0) {
+        console.error(`[${this.streamSid}] No audio data`);
+        resolve();
+        return;
+      }
+
+      const CHUNK_SIZE = 577;
       let sent = 0;
       let index = 0;
 
+      console.log(`[${this.streamSid}] Sending ${Math.ceil(pcmAudio.length / CHUNK_SIZE)} chunks...`);
+
       const sendNextChunk = () => {
         if (index >= pcmAudio.length) {
-          console.log(`[${this.sessionId}] ✓ Audio transmission complete (${sent} chunks, ${pcmAudio.length} bytes total)\n`);
+          this.audioSentCount += sent;
+          console.log(`[${this.streamSid}] Audio sent (${sent} chunks)\n`);
           resolve();
           return;
         }
 
         if (this.exotelWs.readyState !== WebSocket.OPEN) {
-          console.error(`[${this.sessionId}] ✗ WebSocket disconnected during transmission`);
+          console.error(`[${this.streamSid}] WebSocket closed`);
           resolve();
           return;
         }
 
         const chunk = pcmAudio.slice(index, Math.min(index + CHUNK_SIZE, pcmAudio.length));
-        const base64Payload = chunk.toString('base64');
-        
-        const message = JSON.stringify({
-          type: 'media',
-          payload: base64Payload
-        });
-        
+
         try {
-          this.exotelWs.send(message);
+          this.exotelWs.send(chunk);
           sent++;
           index += CHUNK_SIZE;
-          console.log(`[${this.sessionId}] 📤 Sent chunk ${sent} (${chunk.length} bytes -> base64)`);
-          
-          // 100ms timing between chunks
-          setTimeout(sendNextChunk, 100);
+          setTimeout(sendNextChunk, 72);
         } catch (error) {
-          console.error(`[${this.sessionId}] ✗ Error sending chunk:`, error.message);
+          console.error(`[${this.streamSid}] Send error:`, error.message);
           resolve();
         }
       };
@@ -310,223 +277,91 @@ class VoiceSession {
     });
   }
 
-  handleExotelEvent(message) {
-    try {
-      let event;
-      
-      // Try to parse as JSON first (Exotel events)
-      try {
-        event = JSON.parse(message);
-      } catch {
-        // If not JSON, it might be raw audio data
-        console.log(`[${this.sessionId}] 📊 Received binary audio data: ${message.length} bytes`);
-        this.sendAudioToDeepgram(message);
-        return;
-      }
-
-      if (!event.type) {
-        console.log(`[${this.sessionId}] ⚠ Event missing type field`);
-        return;
-      }
-
-      console.log(`[${this.sessionId}] 📨 Exotel event: ${event.type}`);
-
-      switch(event.type) {
-        case 'connected':
-          console.log(`[${this.sessionId}] ✓ CONNECTED - WebSocket handshake successful, initializing bot`);
-          break;
-          
-        case 'start':
-          console.log(`[${this.sessionId}] ✓ START - Audio streaming beginning from caller`);
-          this.streamStarted = true;
-          break;
-          
-        case 'media':
-          if (event.payload) {
-            try {
-              // Decode base64 audio from Exotel
-              const audioBuffer = Buffer.from(event.payload, 'base64');
-              console.log(`[${this.sessionId}] 📥 Received media chunk: ${audioBuffer.length} bytes`);
-              this.sendAudioToDeepgram(audioBuffer);
-            } catch (err) {
-              console.error(`[${this.sessionId}] ✗ Error decoding audio payload:`, err.message);
-            }
-          }
-          break;
-          
-        case 'dtmf':
-          console.log(`[${this.sessionId}] 🔘 DTMF digit detected: ${event.payload}`);
-          break;
-          
-        case 'stop':
-          console.log(`[${this.sessionId}] ⏹ STOP - Customer leg disconnected`);
-          this.streamStarted = false;
-          break;
-          
-        case 'clear':
-          console.log(`[${this.sessionId}] 🔄 CLEAR - Resetting session context mid-call`);
-          this.isProcessing = false;
-          break;
-          
-        default:
-          console.log(`[${this.sessionId}] ❓ Unknown event type: ${event.type}`);
-      }
-    } catch (error) {
-      console.error(`[${this.sessionId}] ✗ Error handling Exotel event:`, error.message);
-    }
-  }
-
   sendAudioToDeepgram(audioData) {
-    if (!this.deepgramWs || this.deepgramWs.readyState !== WebSocket.OPEN) {
-      console.warn(`[${this.sessionId}] ⚠ Deepgram not ready (state: ${this.deepgramWs?.readyState})`);
-      return;
-    }
-    
-    try {
-      this.deepgramWs.send(audioData);
-    } catch (error) {
-      console.error(`[${this.sessionId}] ✗ Error sending to Deepgram:`, error.message);
+    if (this.deepgramConnection) {
+      try {
+        this.deepgramConnection.send(audioData);
+      } catch (error) {
+        console.error(`[${this.streamSid}] Deepgram send error:`, error.message);
+      }
     }
   }
 
   cleanup() {
-    if (this.deepgramWs && this.deepgramWs.readyState !== WebSocket.CLOSED) {
-      this.deepgramWs.close();
+    if (this.deepgramConnection) {
+      this.deepgramConnection.finish();
     }
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
     }
-    if (this.silenceTimeout) {
-      clearTimeout(this.silenceTimeout);
-    }
-    console.log(`[${this.sessionId}] ✗ Session cleaned up\n`);
+    console.log(`[${this.streamSid}] Session ended\n`);
   }
 }
 
-// WebSocket connection handler
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   console.log('\n' + '='.repeat(70));
-  console.log('📞 NEW CALL CONNECTED');
+  console.log('CALL CONNECTED');
   console.log('='.repeat(70));
-  
-  // Extract parameters from URL
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const sessionId = url.searchParams.get('sessionId') || `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  const callSid = url.searchParams.get('callSid') || url.searchParams.get('call_sid') || 'unknown';
-  
-  console.log(`Session ID: ${sessionId}`);
-  console.log(`Call SID: ${callSid}`);
-  
-  const session = new VoiceSession(ws, sessionId, callSid);
+
+  const session = new VoiceSession(ws, `stream_${Date.now()}`, 'unknown');
   sessions.set(ws, session);
 
-  // Send greeting after connection is established
   setTimeout(async () => {
     try {
-      console.log(`[${session.sessionId}] 🎤 Sending greeting...`);
+      console.log(`[${session.streamSid}] Sending greeting...`);
       await session.convertToSpeech("Hello! How can I help you today?");
     } catch (error) {
-      console.error(`[${session.sessionId}] ✗ Greeting error:`, error.message);
+      console.error(`[${session.streamSid}] Greeting error:`, error.message);
     }
   }, 1000);
 
   ws.on('message', (data) => {
-    // Handle both text and binary messages
-    if (typeof data === 'string') {
-      session.handleExotelEvent(data);
-    } else if (Buffer.isBuffer(data)) {
-      console.log(`[${session.sessionId}] 📊 Received binary message: ${data.length} bytes`);
-      session.handleExotelEvent(data);
+    if (Buffer.isBuffer(data)) {
+      session.audioReceivedCount++;
+      if (session.audioReceivedCount % 10 === 0) {
+        console.log(`[${session.streamSid}] Audio received (${session.audioReceivedCount} chunks)`);
+      }
+      session.sendAudioToDeepgram(data);
     }
   });
 
   ws.on('close', () => {
     console.log('='.repeat(70));
-    console.log('📞 CALL DISCONNECTED');
-    console.log('='.repeat(70));
+    console.log('CALL ENDED');
+    console.log('='.repeat(70) + '\n');
     session.cleanup();
     sessions.delete(ws);
   });
 
   ws.on('error', (error) => {
-    console.error(`[${session.sessionId}] ✗ WebSocket error:`, error.message);
+    console.error(`[${session.streamSid}] WebSocket error:`, error.message);
     session.cleanup();
     sessions.delete(ws);
   });
 });
 
-// Health endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
+  res.json({
     status: 'ok',
     activeSessions: sessions.size,
     timestamp: new Date().toISOString()
   });
 });
 
-// Passthru endpoint for Exotel after stream ends
-app.post('/passthru', (req, res) => {
-  const { call_sid, session_id } = req.body;
-  
-  console.log(`\n[Passthru] Call SID: ${call_sid}, Session: ${session_id}`);
-  console.log('[Passthru] Stream session ended - Routing options:');
-  console.log('  1. Escalate to agent');
-  console.log('  2. End call');
-  console.log('  3. Route to another applet');
-  
-  // Example: Route to agent after successful bot interaction
-  res.json({
-    escalate: false, // Set to true to route to Exotel agent
-    status: 'completed',
-    message: 'Bot interaction completed'
-  });
-});
-
-// Start server
 server.listen(CONFIG.PORT, '0.0.0.0', () => {
   console.log('\n' + '='.repeat(70));
-  console.log('✅ VOICE AI PIPELINE SERVER STARTED');
+  console.log('SERVER READY');
   console.log('='.repeat(70));
   console.log(`Port: ${CONFIG.PORT}`);
-  console.log(`Listening on: 0.0.0.0:${CONFIG.PORT}`);
-  console.log(`WebSocket Protocol: wss://`);
-  console.log(`Health check: GET /health`);
-  console.log(`Passthru endpoint: POST /passthru`);
   console.log('='.repeat(70) + '\n');
 });
 
-// Graceful shutdown
-process.on('uncaughtException', (error) => {
-  console.error('✗ UNCAUGHT EXCEPTION:', error.message);
-  console.error(error.stack);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('✗ UNHANDLED REJECTION:', reason);
-});
-
 process.on('SIGTERM', () => {
-  console.log('\n🛑 Shutting down gracefully...');
-  
-  // Close all sessions
-  sessions.forEach((session, ws) => {
-    session.cleanup();
-    ws.close();
-  });
-  
+  console.log('Shutting down...');
+  sessions.forEach((session) => session.cleanup());
   server.close(() => {
-    console.log('✓ Server closed');
+    console.log('Closed');
     process.exit(0);
   });
-  
-  setTimeout(() => {
-    console.error('✗ Forced exit after timeout');
-    process.exit(1);
-  }, 10000);
+  setTimeout(() => process.exit(1), 10000);
 });
-
-// Health monitoring
-setInterval(() => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] 📊 Health check - Active sessions: ${sessions.size}`);
-}, 30000);
