@@ -4,7 +4,7 @@ const http = require('http');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const { Readable } = require('stream');
-const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+const { createClient } = require('@deepgram/sdk');
 
 require('dotenv').config();
 
@@ -59,7 +59,7 @@ async function convertMp3ToPcm(mp3Buffer) {
 class VoiceSession {
   constructor(exotelWs, streamSid, callSid) {
     this.exotelWs = exotelWs;
-    this.deepgramConnection = null;
+    this.deepgramWs = null;
     this.streamSid = streamSid;
     this.callSid = callSid;
     this.isProcessing = false;
@@ -75,7 +75,7 @@ class VoiceSession {
       }
     });
 
-    this.initDeepgram();
+    this.initDeepgramV2();
     this.startHeartbeat();
   }
 
@@ -87,53 +87,66 @@ class VoiceSession {
     }, 5000);
   }
 
-  initDeepgram() {
-    const deepgram = createClient(CONFIG.DEEPGRAM_API_KEY);
+  initDeepgramV2() {
+    // Using Deepgram V2 API (like the Python example)
+    const deepgramUrl = `wss://api.deepgram.com/v2/listen?model=nova-3&language=en-US&smart_format=true&interim_results=true&vad=true&endpointing=1ms&encoding=linear16&sample_rate=8000`;
 
-    this.deepgramConnection = deepgram.listen.live({
-      model: 'nova-3',
-      language: 'en-US',
-      smart_format: true,
-      interim_results: true,
-      vad: true,
-      endpointing: '1ms'
-    });
+    console.log(`[${this.streamSid}] Connecting to Deepgram V2 WebSocket...`);
 
-    this.deepgramConnection.on(LiveTranscriptionEvents.Open, () => {
-      console.log(`[${this.streamSid}] Deepgram connected`);
-    });
-
-    this.deepgramConnection.on(LiveTranscriptionEvents.Transcript, async (data) => {
-      try {
-        const transcript = data.channel?.alternatives?.[0]?.transcript;
-        const isFinal = data.is_final;
-        const speechFinal = data.speech_final;
-
-        if (transcript?.trim()) {
-          if (isFinal && speechFinal) {
-            console.log(`[${this.streamSid}] FINAL: "${transcript}"`);
-            console.log(`[${this.streamSid}] Requesting response...`);
-
-            if (!this.isProcessing) {
-              this.isProcessing = true;
-              await this.processWithVoiceflow(transcript);
-              this.isProcessing = false;
-            }
-          } else if (!isFinal) {
-            console.log(`[${this.streamSid}] interim: "${transcript}"`);
-          }
-        }
-      } catch (error) {
-        console.error(`[${this.streamSid}] Transcript error:`, error.message);
-        this.isProcessing = false;
+    this.deepgramWs = new WebSocket(deepgramUrl, {
+      headers: {
+        'Authorization': `Token ${CONFIG.DEEPGRAM_API_KEY}`
       }
     });
 
-    this.deepgramConnection.on(LiveTranscriptionEvents.Error, (error) => {
-      console.error(`[${this.streamSid}] Deepgram error:`, error.message);
+    this.deepgramWs.on('open', () => {
+      console.log(`[${this.streamSid}] Deepgram V2 WebSocket connected`);
     });
 
-    this.deepgramConnection.on(LiveTranscriptionEvents.Close, () => {
+    this.deepgramWs.on('message', async (data) => {
+      try {
+        const response = JSON.parse(data);
+        
+        // Debug: Log message structure
+        console.log(`[${this.streamSid}] Deepgram message type: ${response.type || 'unknown'}`);
+
+        // Handle Results message
+        if (response.type === 'Results' || response.channel) {
+          const transcript = response.channel?.alternatives?.[0]?.transcript;
+          const isFinal = response.is_final;
+          const speechFinal = response.speech_final;
+
+          if (transcript?.trim()) {
+            if (isFinal && speechFinal) {
+              console.log(`[${this.streamSid}] FINAL: "${transcript}"`);
+              console.log(`[${this.streamSid}] Requesting response...`);
+
+              if (!this.isProcessing) {
+                this.isProcessing = true;
+                await this.processWithVoiceflow(transcript);
+                this.isProcessing = false;
+              }
+            } else if (!isFinal) {
+              console.log(`[${this.streamSid}] interim: "${transcript}"`);
+            }
+          }
+        } else {
+          console.log(`[${this.streamSid}] Other Deepgram message:`, JSON.stringify(response).substring(0, 100));
+        }
+      } catch (error) {
+        console.log(`[${this.streamSid}] Non-JSON message from Deepgram (binary data?)`);
+      }
+    });
+
+    this.deepgramWs.on('error', (error) => {
+      console.error(`[${this.streamSid}] Deepgram error:`, error.message);
+      console.error(`[${this.streamSid}] Troubleshooting:`);
+      console.error(`  - Check API key is correct`);
+      console.error(`  - Verify outbound WebSocket is allowed`);
+      console.error(`  - Check if hosting provider blocks Deepgram`);
+    });
+
+    this.deepgramWs.on('close', () => {
       console.log(`[${this.streamSid}] Deepgram closed`);
     });
   }
@@ -278,18 +291,20 @@ class VoiceSession {
   }
 
   sendAudioToDeepgram(audioData) {
-    if (this.deepgramConnection) {
-      try {
-        this.deepgramConnection.send(audioData);
-      } catch (error) {
-        console.error(`[${this.streamSid}] Deepgram send error:`, error.message);
-      }
+    if (!this.deepgramWs || this.deepgramWs.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    try {
+      this.deepgramWs.send(audioData);
+    } catch (error) {
+      console.error(`[${this.streamSid}] Deepgram send error:`, error.message);
     }
   }
 
   cleanup() {
-    if (this.deepgramConnection) {
-      this.deepgramConnection.finish();
+    if (this.deepgramWs && this.deepgramWs.readyState !== WebSocket.CLOSED) {
+      this.deepgramWs.close();
     }
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
